@@ -1,0 +1,217 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Creates EventBridge rule for WorkSpace termination and SSM Automation'
+
+Resources:
+  # IAM Role for SSM Automation
+  SSMAutomationRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonSSMAutomationRole
+      Policies:
+        - PolicyName: SSMAutomationCustomPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:DescribeInstanceInformation
+                  - workspaces:DescribeWorkspaces
+                  - ssm:ListInventoryEntries
+                  - ssm:DeregisterManagedInstance
+                Resource: '*'
+
+  # SSM Automation Document
+  DeregisterManagedInstanceAutomation:
+    Type: 'AWS::SSM::Document'
+    Properties:
+      DocumentType: Automation
+      Content:
+        description: Deregister Managed Instances after termination of Workspaces
+        schemaVersion: '0.3'
+        assumeRole: '{{AutomationAssumeRole}}'
+        parameters:
+          AutomationAssumeRole:
+            type: String
+            description: (Required) The ARN of the role that allows Automation to perform the actions on your behalf.
+            default: ''
+          WorkspaceID:
+            type: String
+            description: (Required) The WorkSpace ID to find corresponding managed instance.
+            default: ''
+        mainSteps:
+          - name: GetManagedInstanceId
+            action: aws:executeScript
+            nextStep: DeregisterManagedInstance
+            isEnd: false
+            inputs:
+              Runtime: python3.11
+              Handler: script_handler
+              InputPayload:
+                workspaceId: '{{ WorkspaceID }}'
+              Script: |
+                def script_handler(events, context):
+                    import boto3
+                    import logging
+                    from botocore.exceptions import ClientError
+                    
+                    # Set up logging
+                    logging.basicConfig(level=logging.INFO)
+                    logger = logging.getLogger()
+                    
+                    try:
+                        ssm = boto3.client('ssm')
+                        workspaces = boto3.client('workspaces')
+                        workspace_id = events['workspaceId']
+                        managed_instance_id = None
+                        
+                        logger.info(f"Searching for managed instance with WorkspaceID: {workspace_id}")
+                        
+                        # Get WorkSpace details to retrieve ComputerName
+                        try:
+                            workspace_details = workspaces.describe_workspaces(WorkspaceIds=[workspace_id])
+                            if not workspace_details['Workspaces']:
+                                raise Exception(f"No WorkSpace found with ID: {workspace_id}")
+                            computer_name = workspace_details['Workspaces'][0]['ComputerName']
+                        except Exception as e:
+                            logger.error(f"Error retrieving WorkSpace details: {str(e)}")
+                            raise
+                        
+                        # Get list of managed instances
+                        paginator = ssm.get_paginator('describe_instance_information')
+                        for page in paginator.paginate():
+                            for instance in page['InstanceInformationList']:
+                                if instance['InstanceId'].startswith('mi-'):
+                                    try:
+                                        # Check Custom:WorkspaceMapping inventory for this instance
+                                        inventory_response = ssm.list_inventory_entries(
+                                            InstanceId=instance['InstanceId'],
+                                            TypeName='Custom:WorkspaceMapping',
+                                            Filters=[
+                                                {
+                                                    'Key': 'WorkspaceId',
+                                                    'Values': [workspace_id],
+                                                    'Type': 'Equal'
+                                                },
+                                                {
+                                                    'Key': 'ComputerName',
+                                                    'Values': [computer_name],
+                                                    'Type': 'Equal'
+                                                }
+                                            ]
+                                        )
+                                        
+                                        if inventory_response['Entries']:
+                                            logger.info(f"Found matching managed instance: {instance['InstanceId']}")
+                                            managed_instance_id = instance['InstanceId']
+                                            break
+                                            
+                                    except ClientError as e:
+                                        if e.response['Error']['Code'] == 'TypeNotFound':
+                                            logger.warning(f"No Custom:WorkspaceMapping inventory found for instance {instance['InstanceId']}")
+                                            continue
+                                        else:
+                                            logger.error(f"Error checking inventory for instance {instance['InstanceId']}: {str(e)}")
+                                            continue
+                            
+                            if managed_instance_id:
+                                break
+                        
+                        if not managed_instance_id:
+                            error_msg = f"No managed instance found with WorkspaceID: {workspace_id} and ComputerName: {computer_name}"
+                            logger.error(error_msg)
+                            raise Exception(error_msg)
+                        
+                        return {
+                            "ManagedInstanceId": managed_instance_id
+                        }
+                        
+                    except Exception as e:
+                        logger.error(f"Error in script execution: {str(e)}")
+                        raise
+            outputs:
+              - Name: ManagedInstanceId
+                Selector: $.Payload.ManagedInstanceId
+                Type: String
+          - name: DeregisterManagedInstance
+            action: aws:executeAwsApi
+            isEnd: true
+            inputs:
+              Service: ssm
+              Api: DeregisterManagedInstance
+              InstanceId: '{{ GetManagedInstanceId.ManagedInstanceId }}'
+
+  # EventBridge Rule
+  WorkspaceTerminationRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Description: 'Rule to trigger SSM Automation when WorkSpaces are terminated'
+      EventPattern:
+        source:
+          - aws.workspaces
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - workspaces.amazonaws.com
+          eventName:
+            - TerminateWorkspaces
+      State: ENABLED
+      Targets:
+        - Arn: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:automation-definition/${DeregisterManagedInstanceAutomation}'
+          Id: 'SSMAutomationTarget'
+          RoleArn: !GetAtt EventBridgeSSMRole.Arn
+          InputTransformer:
+            InputPathsMap:
+              workspaceId: "$.detail.requestParameters.terminateWorkspaceRequests[0].workspaceId"
+            InputTemplate: !Sub |
+              {
+                "AutomationAssumeRole": ["${SSMAutomationRole.Arn}"],
+                "WorkspaceID": ["<workspaceId>"]
+              }
+
+  # IAM Role for EventBridge to invoke SSM Automation
+  EventBridgeSSMRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartSSMAutomation
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:StartAutomationExecution
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:automation-definition/${DeregisterManagedInstanceAutomation}:*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt SSMAutomationRole.Arn
+                Condition:
+                  StringLikeIfExists:
+                    iam:PassedToService: ssm.amazonaws.com
+
+Outputs:
+  SSMAutomationRoleARN:
+    Description: 'ARN of the SSM Automation Role'
+    Value: !GetAtt SSMAutomationRole.Arn
+  AutomationDocumentName:
+    Description: 'Name of the SSM Automation Document'
+    Value: !Ref DeregisterManagedInstanceAutomation
+  EventBridgeRuleName:
+    Description: 'Name of the EventBridge Rule'
+    Value: !Ref WorkspaceTerminationRule

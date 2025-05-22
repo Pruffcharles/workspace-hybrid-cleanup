@@ -1,0 +1,231 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Creates SSM Automation role and State Manager Association for WorkSpace Mapping'
+Resources:
+  SSMAutomationRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonSSMAutomationRole
+      Policies:
+        - PolicyName: SSMAutomationCustomPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:DescribeInstanceInformation
+                  - workspaces:DescribeWorkspaces
+                  - ssm:PutInventory
+                Resource: '*'
+
+  WorkspaceMappingAutomation:
+    Type: 'AWS::SSM::Document'
+    Properties:
+      DocumentType: Automation
+      Content:
+        description: Fetch Workspaces Registered as Managed nodes (Hybrid) and then create Custom Inventory to map the workspacesId to ComputerName, Managed Instance Id
+        schemaVersion: '0.3'
+        assumeRole: '{{AutomationAssumeRole}}'
+        parameters:
+          AutomationAssumeRole:
+            type: String
+            description: (Required) The ARN of the role that allows Automation to perform the actions on your behalf. If no role is specified, Systems Manager Automation uses your IAM permissions to use this runbook.
+            default: ''
+        mainSteps:
+          - name: GetHybridInstances
+            action: aws:executeScript
+            nextStep: PutCustomInventory
+            isEnd: false
+            inputs:
+              Runtime: python3.11
+              Handler: script_handler
+              Script: |
+                def script_handler(events, context):
+                    import boto3
+                    import logging
+                    import re
+                    from botocore.exceptions import ClientError
+                    
+                    # Set up logging
+                    logging.basicConfig(level=logging.INFO)
+                    logger = logging.getLogger()
+                    
+                    try:
+                        ssm = boto3.client('ssm')
+                        workspaces = boto3.client('workspaces')
+                        
+                        # Step 1: Get hybrid instances information
+                        logger.info("Getting hybrid instances information...")
+                        hybrid_instances_info = []
+                        
+                        paginator = ssm.get_paginator('describe_instance_information')
+                        for page in paginator.paginate():
+                            for instance in page['InstanceInformationList']:
+                                if instance['InstanceId'].startswith('mi-'):
+                                    # Split computer name by period and take first part
+                                    computer_name = instance.get('ComputerName', '').lower()
+                                    if computer_name:
+                                        computer_name = re.split(r'\.', computer_name)[0]
+                                    
+                                    hybrid_instances_info.append({
+                                        'InstanceId': instance['InstanceId'],
+                                        'ComputerName': computer_name
+                                    })
+                        
+                        logger.info(f"Found {len(hybrid_instances_info)} hybrid instances")
+                        
+                        # Step 2: Get all workspaces
+                        logger.info("Getting WorkSpaces information...")
+                        workspace_mappings = []
+                        workspace_paginator = workspaces.get_paginator('describe_workspaces')
+                        
+                        # Create lookup dictionary for hybrid instances by computer name
+                        computer_name_lookup = {instance['ComputerName']: instance for instance in hybrid_instances_info if instance['ComputerName']}
+                        
+                        # Process all workspaces
+                        for workspace_page in workspace_paginator.paginate():
+                            for workspace in workspace_page['Workspaces']:
+                                try:
+                                    workspace_computer_name = workspace.get('ComputerName', '').lower()
+                                    
+                                    # Try matching by computer name
+                                    if workspace_computer_name and workspace_computer_name in computer_name_lookup:
+                                        matched_instance = computer_name_lookup[workspace_computer_name]
+                                        
+                                        mapping = {
+                                            'WorkspaceId': workspace['WorkspaceId'],
+                                            'ComputerName': matched_instance['ComputerName'],
+                                            'InstanceId': matched_instance['InstanceId']
+                                        }
+                                        workspace_mappings.append(mapping)
+                                        logger.info(f"Matched WorkSpace {workspace['WorkspaceId']} to instance {matched_instance['InstanceId']}")
+                                
+                                except ClientError as e:
+                                    logger.error(f"Error getting workspace details for {workspace['WorkspaceId']}: {str(e)}")
+                                    continue
+                        
+                        logger.info(f"Found {len(workspace_mappings)} workspace mappings")
+                        
+                        # Return the final mapping list
+                        return{"Mapping" : workspace_mappings}
+                    except Exception as e:
+                        logger.error(f"Error in script execution: {str(e)}")
+                        raise
+            outputs:
+              - Name: InstanceList
+                Selector: $.Payload.Mapping
+                Type: MapList
+          - name: PutCustomInventory
+            action: aws:executeScript
+            isEnd: true
+            inputs:
+              Runtime: python3.11
+              Handler: script_handler
+              Script: |
+                def script_handler(events, context):
+                    import boto3
+                    import logging
+                    from datetime import datetime, timezone
+                    from botocore.exceptions import ClientError
+
+                    # Set up logging
+                    logging.basicConfig(level=logging.INFO)
+                    logger = logging.getLogger()
+
+                    try:
+                        ssm = boto3.client('ssm')
+                        mappings = events['mappings']
+
+                        logger.info(f"Processing {len(mappings)} workspace mappings")
+
+                        success_count = 0
+                        error_count = 0
+
+                        for mapping in mappings:
+                            try:
+                                # Ensure mapping has required fields
+                                workspace_id = mapping.get('WorkspaceId')
+                                computer_name = mapping.get('ComputerName')
+                                managed_instance_id = mapping.get('InstanceId')
+
+                                if not workspace_id or not computer_name:
+                                    logger.warning(f"Skipping incomplete mapping: {mapping}")
+                                    continue
+
+                                # Create inventory item
+                                response = ssm.put_inventory(
+                                    InstanceId=managed_instance_id,
+                                    Items=[
+                                        {
+                                            'TypeName': 'Custom:WorkspaceMapping',
+                                            'SchemaVersion': '1.0',
+                                            'CaptureTime': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                                            'Content': [
+                                                {
+                                                    'WorkspaceId': workspace_id,
+                                                    'ComputerName': computer_name
+                                                }
+                                            ]
+                                        }
+                                    ]
+                                )
+
+                                success_count += 1
+                                logger.info(f"Successfully created inventory for WorkspaceId: {workspace_id}")
+
+                            except ClientError as e:
+                                error_count += 1
+                                logger.error(f"Error creating inventory for mapping {mapping}: {str(e)}")
+                                continue
+                            except Exception as e:
+                                error_count += 1
+                                logger.error(f"Unexpected error processing mapping {mapping}: {str(e)}")
+                                print(f"there was some other error {str(e)}")
+                                continue
+
+                        result = {
+                            'SuccessCount': success_count,
+                            'ErrorCount': error_count,
+                            'TotalProcessed': len(mappings)
+                        }
+
+                        logger.info("Inventory creation complete. Results: {result}")
+
+                        return {
+                            'StatusCode': 200,
+                            'Results': result
+                        }
+
+                    except Exception as e:
+                        logger.error(f"Error in script execution: {str(e)}")
+                        raise
+              InputPayload:
+                mappings: '{{ GetHybridInstances.InstanceList }}'
+
+  WorkspaceMappingAssociation:
+    Type: 'AWS::SSM::Association'
+    Properties:
+      Name: !Ref WorkspaceMappingAutomation
+      AssociationName: WorkspaceMappingAssociation
+      ScheduleExpression: "rate(30 minutes)"
+      Parameters:
+        AutomationAssumeRole:
+          - !GetAtt SSMAutomationRole.Arn
+
+Outputs:
+  SSMAutomationRoleARN:
+    Description: 'ARN of the SSM Automation Role'
+    Value: !GetAtt SSMAutomationRole.Arn
+  AutomationDocumentName:
+    Description: 'Name of the SSM Automation Document'
+    Value: !Ref WorkspaceMappingAutomation
+  AssociationName:
+    Description: 'Name of the State Manager Association'
+    Value: !Ref WorkspaceMappingAssociation
