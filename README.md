@@ -1,6 +1,8 @@
 # workspace-hybrid-cleanup
 Many customers use SSM to manage their Amazon Workspaces by registering them as *Hybrid managed nodes* [1]. SSM offers a *standard-instances tier* and an *advanced-instances tier* for non-EC2 machines in a hybrid and multicloud environment. You can register up to 1,000 standard hybrid-activated nodes per account per AWS Region at no additional cost. However, registering more than 1,000 hybrid nodes requires that you activate the advanced-instances tier [2]. There is a charge to use the advanced-instances tier. For customers with a large fleet of Amazon Workspaces registered as *Hybrid managed nodes*, they will have to manually clean up terminated Workspaces from Fleet Manager to remain in the *standard-instances tier*. The solution below provides an automated solution to clean up the  *Hybrid managed nodes* from Fleet Manager to remove the administrative overhead from SRE/DevOops/Ops Teams required to manually deregister the terminated managed nodes (Amazon Workspaces) from Fleet Manager and ensure they remain within the *standard-instances tier*.  
 
+**Developed by Charles Adebayo v1 March 2025**
+
 _________________
 
 **Step 1: Create State Manager Association to scan for Hybrid managed nodes and create Custom Inventory**
